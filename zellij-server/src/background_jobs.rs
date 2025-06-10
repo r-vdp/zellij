@@ -546,7 +546,7 @@ pub(crate) fn background_jobs_main(
                     let senders = bus.senders.clone();
                     async move {
                         let output = run_background_command(BackgroundCommand {
-                            program: command,
+                            program: command.clone(),
                             args,
                             env: env_variables,
                             cwd: Some(cwd),
@@ -566,7 +566,11 @@ pub(crate) fn background_jobs_main(
                                 )]));
                             },
                             Err(e) => {
-                                log::error!("Failed to run command: {}", e);
+                                log::error!(
+                                    "Failed to run command: {}, got error: {}",
+                                    &command,
+                                    e
+                                );
                                 let stdout = vec![];
                                 let stderr = format!("{}", e).as_bytes().to_vec();
                                 let exit_code = Some(2);
