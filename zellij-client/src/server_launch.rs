@@ -65,6 +65,50 @@ impl ServerLaunch {
         }
         cmd
     }
+
+    /// The same launch, run inside a new transient systemd user scope.
+    #[cfg(not(windows))]
+    fn command_in_systemd_scope(&self, unit: &str) -> Command {
+        let mut cmd = Command::new("systemd-run");
+        cmd.arg("--user")
+            .arg("--scope")
+            .arg("--slice-inherit")
+            .arg("--same-dir")
+            .arg("--collect")
+            .arg("--quiet")
+            .arg(format!("--unit={}", unit))
+            .arg("--property=TimeoutStopSec=10s")
+            .arg("--")
+            .arg(&self.program)
+            .args(self.args())
+            .envs(&self.env);
+        if let Some(cwd) = &self.cwd {
+            cmd.current_dir(cwd);
+        }
+        cmd
+    }
+}
+
+/// On systemd hosts the server is placed in its own transient user scope so
+/// it does not inherit the spawning terminal emulator's cgroup. Otherwise,
+/// closing the terminal (or session logout) SIGTERMs the server along with
+/// the terminal, and the concurrent client/server SIGTERM is a known
+/// deadlock that stalls scope shutdown until SIGKILL. The daemonised
+/// grandchild stays in the new scope after the intermediate child exits, so
+/// `cmd.status()` semantics are unchanged. Set ZELLIJ_NO_SYSTEMD_SCOPE to
+/// opt out (e.g. inside sandboxes that mask the user bus).
+#[cfg(not(windows))]
+fn systemd_scope_unit() -> Option<String> {
+    if std::env::var_os("ZELLIJ_NO_SYSTEMD_SCOPE").is_some()
+        || !Path::new("/run/systemd/system").is_dir()
+    {
+        return None;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some(format!("app-zellij-server-{}", nanos))
 }
 
 pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
@@ -74,6 +118,12 @@ pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
 }
 
 pub fn spawn_server_with(launch: &ServerLaunch) -> io::Result<()> {
+    #[cfg(not(windows))]
+    let mut cmd = match systemd_scope_unit() {
+        Some(unit) => launch.command_in_systemd_scope(&unit),
+        None => launch.command(),
+    };
+    #[cfg(windows)]
     let mut cmd = launch.command();
     match launch_style(cfg!(windows)) {
         LaunchStyle::WaitForDaemon => {
@@ -198,6 +248,33 @@ mod tests {
                 Some(std::ffi::OsStr::new("xterm-256color"))
             )]
         );
+        assert_eq!(command.get_current_dir(), Some(Path::new("/tmp/project")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scoped_launch_wraps_the_attach_command_line_in_systemd_run() {
+        let mut launch = launch();
+        launch.debug = true;
+        launch
+            .env
+            .insert("TERM".to_owned(), "xterm-256color".to_owned());
+        launch.cwd = Some(PathBuf::from("/tmp/project"));
+        let command = launch.command_in_systemd_scope("app-zellij-server-1");
+        assert_eq!(command.get_program(), "systemd-run");
+        let args = command.get_args().collect::<Vec<_>>();
+        assert!(args.contains(&std::ffi::OsStr::new("--unit=app-zellij-server-1")));
+        let separator = args.iter().position(|a| *a == "--").unwrap();
+        assert_eq!(
+            &args[separator + 1..],
+            [
+                "/usr/bin/zellij",
+                "--server",
+                "/run/zellij/sock/name",
+                "--debug"
+            ]
+        );
+        assert_eq!(command.get_envs().count(), 1);
         assert_eq!(command.get_current_dir(), Some(Path::new("/tmp/project")));
     }
 
