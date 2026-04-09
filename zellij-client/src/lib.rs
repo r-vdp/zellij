@@ -306,9 +306,43 @@ fn spawn_web_server(_cli_args: &CliArgs) -> Result<String, String> {
 ///
 /// On Unix the server daemonizes (double-fork) inside start_server(), so
 /// the intermediate child exits immediately and `cmd.status()` returns.
+///
+/// On systemd hosts the server is placed in its own transient user scope so
+/// it does not inherit the spawning terminal emulator's cgroup. Otherwise,
+/// closing the terminal (or session logout) SIGTERMs the server along with
+/// the terminal, and the concurrent client/server SIGTERM is a known
+/// deadlock that stalls scope shutdown until SIGKILL. The daemonised
+/// grandchild stays in the new scope after the intermediate child exits, so
+/// `cmd.status()` semantics are unchanged. Set ZELLIJ_NO_SYSTEMD_SCOPE to
+/// opt out (e.g. inside sandboxes that mask the user bus).
 #[cfg(not(windows))]
 pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
-    let mut cmd = Command::new(current_exe()?);
+    let exe = current_exe()?;
+    let use_systemd = std::env::var_os("ZELLIJ_NO_SYSTEMD_SCOPE").is_none()
+        && Path::new("/run/systemd/system").is_dir();
+    let mut cmd = if use_systemd {
+        let unit = format!(
+            "app-zellij-server-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let mut c = Command::new("systemd-run");
+        c.arg("--user")
+            .arg("--scope")
+            .arg("--slice-inherit")
+            .arg("--same-dir")
+            .arg("--collect")
+            .arg("--quiet")
+            .arg(format!("--unit={}", unit))
+            .arg("--property=TimeoutStopSec=10s")
+            .arg("--")
+            .arg(exe);
+        c
+    } else {
+        Command::new(exe)
+    };
     cmd.arg("--server").arg(socket_path);
     if debug {
         cmd.arg("--debug");
